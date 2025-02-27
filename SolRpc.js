@@ -1,6 +1,24 @@
-const Web3 = require('@solana/web3.js');
+const {
+    address,
+    createSolanaRpc,
+    generateKeyPair,
+    isAddress,
+    createTransactionMessage,
+    setTransactionMessageFeePayer,
+    setTransactionMessageLifetimeUsingBlockhash,
+    getAddressFromPublicKey,
+    signTransaction,
+    getComputeUnitEstimateForTransactionMessageFactory
+} = require('@solana/web3.js');
+const { pipe } = require('@solana/functional');
+
 const EventEmitter = require('events');
 const bs58 = require('bs58');
+
+// Proxies
+const NONCE_ACCOUNT_LENGTH = 0;
+
+
 class SolRPC {
 
   /**
@@ -14,7 +32,8 @@ class SolRPC {
    */
   constructor(config) {
     this.config = config;
-    this.connection = this.initConnection(this.config);
+    this.rpc = this.initRpcConnection(this.config);
+    this.rpcSubscriptions = this.initRpcSubscriptions(this.config);
     this.emitter = new EventEmitter();
     this.web3 = Web3;
     // configuration for retrieving versioned blocks and transactions
@@ -33,20 +52,131 @@ class SolRPC {
    * @param {string} connectionConfig.host - The host URL or IP address.
    * @param {number} [connectionConfig.port] - The port number (optional).
    * @throws {Error} If the protocol is not specified or is invalid.
-   * @returns {Web3.Connection} A new Web3 Connection instance.
+   * @returns {import('@solana/web3.js').Rpc<import('@solana/web3.js').SolanaRpcApi>}
    */
-  initConnection(connectionConfig) {
+  initRpcConnection(connectionConfig) {
     const { protocol, host, port } = connectionConfig;
     if (!protocol || !['wss', 'http', 'https'].includes(protocol.toLowerCase())) {
       throw new Error('Please provide a valid protocol');
     }
     const connectionString = port ? `${protocol}://${host}:${port}` : `${protocol}://${host}`;
-    return new Web3.Connection(connectionString, 'confirmed');
+    const rpc = createSolanaRpc(connectionString);
+    return rpc;
   }
 
-  getConnection() {
-    return this.connection;
+  initRpcSubscriptions(connectionConfig) {
+    throw new Error('Not implemented');
   }
+
+  async executeRpcRequest() {}
+
+  async executeSubscription() {}
+
+  getConnection() {
+    return this.rpc;
+  }
+  
+  // NEW IMPLEMENTATIONS SECTION
+  async getBalance({ address }) {
+    if (!this.validateAddress({ address })) {
+      return null;
+    }
+    return await this.rpc.getBalance(this.toAddress(address)).send();
+  }
+
+  async sendToAddress(input) {
+    try {
+
+    } catch (err) {
+        throw err;
+    }
+  }
+
+  // New space sandbox
+  /**
+   * 
+   * @param {Object} input 
+   * @param {0 | 'legacy'} input.version
+   * @param {import('@solana/web3.js').Address} input.feePayerAddress
+   * @param {import('@solana/web3.js').Blockhash} input.recentBlockhash
+   */
+  #createTransactionMessageWithFeePayerAndLifetime(input) {
+      try {
+        const { version, feePayerAddress, recentBlockhash } = input;
+    
+        const transactionMessage = pipe(
+            createTransactionMessage({ version }),
+            tx => setTransactionMessageFeePayer(feePayerAddress, tx),
+            tx => setTransactionMessageLifetimeUsingBlockhash(recentBlockhash, tx)
+        );
+        return transactionMessage;        
+    } catch (err) {
+        throw err;
+    }
+  }
+
+  #createType0TransactionMessage() {
+    const transactionMessage = createTransactionMessage({ version: 0 });
+    return transactionMessage;
+  }
+
+  #createTypeLegacyTransactionMessage() {
+    const transactionMessage = createTransactionMessage({ version: 'legacy' });
+    return transactionMessage;
+  }
+
+  async signTransactionMessage(transactionMessage) {
+      try {
+        // Stub feePayer
+        const feePayer = await generateKeyPair();
+        const feePayerAddress = await getAddressFromPublicKey(feePayer.publicKey);
+    
+        const recentBlockhash = await this.#getLatestBlockhash();
+    
+        const transactionMessageWithFeePayerAndLifetime = this.#createTransactionMessageWithFeePayerAndLifetime({ feePayerAddress, recentBlockhash: recentBlockhash.blockhash });
+        const signedTransaction = await signTransaction([feePayer], transactionMessageWithFeePayerAndLifetime);
+        return signedTransaction;
+    } catch (err) {
+        throw err;
+    }
+  }
+
+  async #getLatestBlockhash() {
+    try {
+        const recentBlockhash = (await this.rpc.getLatestBlockhash().send()).value;
+        return recentBlockhash;
+    } catch (err) {
+        throw err;
+    }
+  }
+
+  /**
+   * STUBBED
+   */
+  async estimateFee() {
+    return 5000;
+  }
+
+  async estimateTransactionFee(transactionMessage) {
+    const getComputeUnitEstimateForTransactionMessage = getComputeUnitEstimateForTransactionMessageFactory({ rpc: this.rpc });
+    const computeUnitsEstimate = await getComputeUnitEstimateForTransactionMessage(transactionMessage);
+    return computeUnitsEstimate;
+  }
+
+  async getBestBlockHash() {
+    const tip = await this.getTip();
+    return tip?.hash || null;
+  }
+  async getTip() {
+      try {
+        const slot = await this.rpc.getSlot({ commitment: 'confirmed' }).send();
+        const block = await this.rpc.getBlock(slot, this._versionedConfig).send();
+        return { height: slot, hash: block.blockhash };
+    } catch (err) {
+        throw err;
+    }
+  }
+  // END NEW IMPLEMENTATIONS SECTION
 
   /**
    * Retrieves the balance of the specified address.
@@ -55,12 +185,7 @@ class SolRPC {
    * @param {string} params.address - The public key of the address to check the balance for.
    * @returns {Promise<number|null>} The balance of the specified address in lamports.
    */
-  async getBalance({ address }) {
-    if (!this.validateAddress({ address })) {
-      return null;
-    }
-    return await this.connection.getBalance(this.toAddress(address));
-  }
+
 
   /**
    * Sends a specified amount of lamports to a given address, either through a versioned or legacy transaction.
@@ -169,8 +294,12 @@ class SolRPC {
     if (!(nonceAccountKeypair instanceof Web3.Keypair)) {
       throw new Error('Invalid Solana Keypair: Nonce Account ');
     }
-    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-    const minimumRent = await this.connection.getMinimumBalanceForRentExemption(Web3.NONCE_ACCOUNT_LENGTH);
+    // const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+    const { value } = await this.rpc.getLatestBlockhash().send();
+    const { blockhash, lastValidBlockHeight } = value;
+
+    const minRentLamports = await this.rpc.getMinimumBalanceForRentExemption(NONCE_ACCOUNT_LENGTH).send();
+
     const nonceAccountTransaction = new Web3.Transaction({
       feePayer: senderKeypair.publicKey,
       recentBlockhash: blockhash,
@@ -311,19 +440,7 @@ class SolRPC {
     return transaction;
   }
 
-  /**
-   * Retrieves the hash of the best block (tip) in the blockchain.
-   * This function fetches the tip of the blockchain and returns its hash.
-   * 
-   * @returns {Promise<string|null>} The hash of the best block or null if the tip is not available.
-   */
-  async getBestBlockHash() {
-    const tip = await this.getTip();
-    if (!tip) {
-      return null;
-    }
-    return tip.hash;
-  }
+
 
   /**
    * Retrieves a transaction by its transaction ID.
@@ -336,7 +453,7 @@ class SolRPC {
     if (!txid || !this.isBase58(txid)) {
       return null;
     }
-    const tx = await this.connection.getTransaction(txid, this._versionedConfig);
+    const tx = await this.rpc.getTransaction(txid, this._versionedConfig).send();
     if (!tx) {
       return null;
     }
@@ -349,18 +466,19 @@ class SolRPC {
    * @param {string} params.address - Account address to get transactions for.
    * @returns {Promise<Array<Web3.VersionedTransactionResponse>|null>} A promise that resolves to an array of transactions.
    */
-  async getTransactions({ address }) {
-    if (!this.validateAddress({ address })) {
+  async getTransactions({ address: addressInput }) {
+    if (!this.validateAddress({ address: addressInput })) {
       return null;
     }
-    const pubkey = new Web3.PublicKey(address);
-    const txids = await this.connection.getSignaturesForAddress(pubkey);
+    const address = this.toAddress(addressInput);
+    const txids = (await this.rpc.getSignaturesForAddress(address).send()).map(el => el.signature);
+    // const transactions = await this.rpc.getParsedTransactions(txids);
     const transactions = [];
 
     // Fetch transaction details for each signature
     for (const txid of txids) {
       try {
-        const tx = await this.connection.getTransaction(txid.signature, this._versionedConfig);
+        const tx = await this.rpc.getTransaction(txid, this._versionedConfig).send();
         if (tx) {
           transactions.push(tx);
         }
@@ -379,16 +497,16 @@ class SolRPC {
    * @param {string} params.address - The account address to get the transaction count for.
    * @returns {Promise<number|null>} A promise that resolves to the number of confirmed transactions.
    */
-  async getTransactionCount({ address }) {
-    if (!this.validateAddress({ address })) {
+  async getTransactionCount({ addressInput }) {
+    if (!this.validateAddress({ address: addressInput })) {
       return null;
     }
-    const key = new Web3.PublicKey(address);
-    let signatures = await this.connection.getSignaturesForAddress(key);
+    const address = this.toAddress(addressInput);
+    let signatures = await this.rpc.getSignaturesForAddress(address).send();
     let result = signatures.length;
     while (signatures.length === 1000) {
       const beforeSignature = signatures[signatures.length - 1].signature;
-      const nextBatch = await this.connection.getSignaturesForAddress(key, { before: beforeSignature });
+      const nextBatch = await this.rpc.getSignaturesForAddress(address, { before: beforeSignature }).send();
       signatures = nextBatch;
       result += signatures.length;
     }
@@ -457,14 +575,14 @@ class SolRPC {
    * @returns {Promise<Web3.BlockResponse|null>} A promise that resolves to the block object or null if not found.
    * @throws {Error} If hash is provided instead of height.
    */
-  async getBlock({ hash, height }) {
-    if (Number.isInteger(height)) {
-      return await this.connection.getBlock(height, this._versionedConfig);
+  async getBlock({ hash, slot }) {
+    if (!Number.isInteger(slot)) {
+        return null;
     }
     if (hash) {
       throw new Error('Hash is not supported. Provide a height instead');
     }
-    return null;
+    return await this.rpc.getBlock(slot, this._versionedConfig).send();
   }
 
   /**
@@ -478,30 +596,19 @@ class SolRPC {
     if (!txid || !this.isBase58(txid)) {
       return null;
     }
-    const status = await this.connection.getSignatureStatus(txid);
-    if (status && status.value && status.value.confirmations) {
-      return status.value.confirmations;
+    const status = (await this.rpc.getSignatureStatuses([txid]).send())?.value?.[0];
+    if (status?.confirmations) {
+      return status.confirmations;
     }
-    const latestSlot = await this.connection.getSlot({ commitment: 'confirmed' });
-    if (status && status.value && latestSlot) {
-      return latestSlot - status.value.slot;
+    const latestSlot = await this.rpc.getSlot({ commitment: 'confirmed' }).send();
+    if (status && latestSlot) {
+      return latestSlot - status.slot;
     }
-    const tx = await this.connection.getTransaction(txid, this._versionedConfig);
-    if (latestSlot && tx && tx.slot) {
+    const tx = await this.rpc.getTransaction(txid, this._versionedConfig).send();
+    if (latestSlot && tx?.slot) {
       return latestSlot - tx.slot;
     }
     return null;
-  }
-
-  /**
-   * Get the current tip of the blockchain.
-   * Solana slot is synonymous with a blockchains height.
-   * @returns {Promise<Object>} - An object containing the height (slot) and hash of the current block.
-   */
-  async getTip() {
-    const height = await this.connection.getSlot({ commitment: 'confirmed' });
-    const block = await this.connection.getBlock(height, this._versionedConfig);
-    return { height, hash: block.blockhash };
   }
 
   getTxOutputInfo() {
@@ -517,8 +624,7 @@ class SolRPC {
    */
   validateAddress({ address }) {
     try {
-      this.toAddress(address);
-      return true;
+      return isAddress(address);
     } catch (error) {
       return false;
     }
@@ -534,7 +640,7 @@ class SolRPC {
    * @returns {Promise<Web3.Version>} - The version information of the Solana node.
    */
   async getServerInfo() {
-    return await this.connection.getVersion();
+    return await this.rpc.getVersion().send();
   }
 
   /**
@@ -544,12 +650,7 @@ class SolRPC {
    * @returns {boolean} True if the address is valid, false otherwise.
    */
   isValidAddress(address) {
-    try {
-      this.toAddress(address);
-      return true;
-    } catch (error) {
-      return false;
-    }
+    return this.validateAddress({ address })
   }
 
   /**
@@ -570,11 +671,11 @@ class SolRPC {
   /**
    * Converts the given address to a Solana Web3 PublicKey instance.
    * 
-   * @param {string} address - The address to convert.
-   * @returns {Web3.PublicKey} The converted Web3 PublicKey instance.
+   * @param {string} addressToConvert - The address to convert.
+   * @returns {import('@solana/web3.js').Address<string>}
    */
-  toAddress(address) {
-    return new Web3.PublicKey(address);
+  toAddress(addressToConvert) {
+    return address(addressToConvert);
   }
 
   /**
