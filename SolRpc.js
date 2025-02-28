@@ -117,14 +117,15 @@ class SolRPC {
    * 
    * @param {Object} params - The parameters for retrieving the balance.
    * @param {string} params.address - The public key of the address to check the balance for.
-   * @returns {Promise<number|null>} The balance of the specified address in lamports.
+   * @returns {Promise<import('@solana/web3.js').Lamports|null>} The balance of the specified address in lamports.
    * @DONE
    */
   async getBalance({ address }) {
     if (!this.validateAddress({ address })) {
       return null;
     }
-    return await this.rpc.getBalance(this.toAddress(address)).send();
+    const { value: lamports } = await this.rpc.getBalance(this.toAddress(address)).send();
+    return lamports;
   }
 
   /**
@@ -143,8 +144,7 @@ class SolRPC {
    */
   async sendToAddress({ address: addressStr, amount, fromAccountKeypair, nonceAddress, txType = 'legacy', priority }) {
     try {
-        /** @TODO */
-      if (!(fromAccountKeypair instanceof Web3.Keypair)) {
+      if (!(fromAccountKeypair instanceof CryptoKeyPair)) {
         throw new Error('Invalid Solana Keypair object');
       }
 
@@ -153,9 +153,7 @@ class SolRPC {
       const destinationAddress = this.toAddress(addressStr);
       const block = await this.getTip();
       let transaction;
-      let sendParams;
 
-      // New code
       let transactionMessage = pipe(
         createTransactionMessage({ version: txType }),
         tx => setTransactionMessageFeePayer(fromAccountAddress, tx),
@@ -175,24 +173,16 @@ class SolRPC {
         transactionMessage = await this.addPriorityFee({ transaction: transactionMessage })
       }
 
-      // end new code
-
-
-      if (txType == 0) {
-        // versioned tx
-        sendParams = [transactionMessage, { maxRetries: 5 }];
-      } else {
-        // legacy
-        sendParams = [transactionMessage, [fromAccountKeypair], { maxRetries: 5 }];
-      }
-      if (priority) {
-        transactionMessage = await this.addPriorityFee({ transaction });
-      }
+      const sendParams = [transactionMessage, { maxRetries: 5 }];
+      // if (txType === 'legacy') {
+      //   sendParams.splice(1, 0, [fromAccountKeypair]);
+      // }
 
       /** @BOOKMARK */
       if (txType == 0) {
         transaction.sign([fromAccountKeypair]);
       }
+
       const txid = await this.connection.sendTransaction(...sendParams);
       return txid;
     } catch (err) {
