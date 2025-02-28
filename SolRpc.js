@@ -21,13 +21,15 @@ const {
     appendTransactionMessageInstructions,
     appendTransactionMessageInstruction,
     compileTransactionMessage,
-    getCompiledTransactionMessageEncoder
+    getCompiledTransactionMessageEncoder,
+    getBase64Decoder,
+    appendTransactionMessageInstructions
 } = require('@solana/web3.js');
 const {
     getSetComputeUnitLimitInstruction,
     getSetComputeUnitPriceInstruction,
   } = require('@solana-program/compute-budget');
-  import { getAddMemoInstruction } from "@solana-program/memo";
+const { getTransferSolInstruction } = require('@solana-program/system');
   
 const { pipe } = require('@solana/functional');
 const EventEmitter = require('events');
@@ -90,7 +92,7 @@ class SolRPC {
     return rpc;
   }
 
-  /** @TODO */
+  /** @DONE */
   initRpcSubscriptions(connectionConfig) {
     return createSolanaRpcSubscriptions(this.wsUrl);
   }
@@ -131,38 +133,63 @@ class SolRPC {
    * @param {Object} params - The parameters for the transaction.
    * @param {string} params.address - The public key of the recipient.
    * @param {number} params.amount - The amount of lamports to send.
-   * @param {Object} params.fromAccountKeypair - The keypair of the sender.
-   * @param {string} params.nonceAddress - The public key of the nonce account (optional).
+   * @param {CryptoKeyPair} params.fromAccountKeypair - The keypair of the sender.
+   * @param {string} [params.nonceAddress] - The public key of the nonce account (optional).
    * @param {string} [params.txType='legacy'] - The type of transaction ('legacy' or '0' for versioned).
    * @param {boolean} [params.priority=false] - Whether to add a priority fee to the transaction.
    * @returns {Promise<string>} The transaction hash.
    * @throws {Error} If the transaction confirmation returns an error.
-   * @TODO
+   * @TODO largely done
    */
-  async sendToAddress({ address, amount, fromAccountKeypair, nonceAddress, txType = 'legacy', priority }) {
+  async sendToAddress({ address: addressStr, amount, fromAccountKeypair, nonceAddress, txType = 'legacy', priority }) {
     try {
+        /** @TODO */
       if (!(fromAccountKeypair instanceof Web3.Keypair)) {
         throw new Error('Invalid Solana Keypair object');
       }
 
-      const fromAccount = fromAccountKeypair.publicKey;
-      address = new Web3.PublicKey(address);
+      const fromAccountPublicKey = fromAccountKeypair.publicKey;
+      const fromAccountAddress = await getAddressFromPublicKey(fromAccountPublicKey);
+      const destinationAddress = this.toAddress(addressStr);
       const block = await this.getTip();
       let transaction;
       let sendParams;
 
+      // New code
+      let transactionMessage = pipe(
+        createTransactionMessage({ version: txType }),
+        tx => setTransactionMessageFeePayer(fromAccountAddress, tx),
+        tx => setTransactionMessageLifetimeUsingBlockhash(block.hash, tx),
+        tx => appendTransactionMessageInstructions([
+            getSetComputeUnitPriceInstruction({ microLamports: 5000n }),
+            getTransferSolInstruction({
+                amount, // @TODO look at this
+                destination: destinationAddress,
+                source: fromAccountAddress
+            }),
+        ])
+      );
+
+      if (priority) {
+        /** @TODO */
+        transactionMessage = await this.addPriorityFee({ transaction: transactionMessage })
+      }
+
+      // end new code
+
+
       if (txType == 0) {
         // versioned tx
-        transaction = await this._createTransferTxType0({ address, amount, fromAccount, block, nonceAddress });
-        sendParams = [transaction, { maxRetries: 5 }];
+        sendParams = [transactionMessage, { maxRetries: 5 }];
       } else {
         // legacy
-        transaction = await this._createTransferTxTypeLegacy({ address, amount, fromAccount, block, nonceAddress });
-        sendParams = [transaction, [fromAccountKeypair], { maxRetries: 5 }];
+        sendParams = [transactionMessage, [fromAccountKeypair], { maxRetries: 5 }];
       }
       if (priority) {
-        transaction = await this.addPriorityFee({ transaction });
+        transactionMessage = await this.addPriorityFee({ transaction });
       }
+
+      /** @BOOKMARK */
       if (txType == 0) {
         transaction.sign([fromAccountKeypair]);
       }
@@ -174,12 +201,39 @@ class SolRPC {
     }
   }
 
-  /** @TODO */
-  async _createTransferTxType0({ address, amount, fromAccount, block, nonceAddress }) {
+  /**
+   * 
+   * @param {Object} params
+   * @param {import("@solana/web3.js").Address<string>} params.destinationAddressddress - destination
+   * @param {number} params.amount - The amount of lamports to send.
+   * @param {CryptoKey} params.fromAccountPublicKey
+   * @param {import("@solana/web3.js").Blockhash} params.blockhash
+   * @param {string} params.nonceAddressStr
+   * @param {0 | 'legacy'} [params.version='legacy'] 
+   * @REVIEW
+   */
+  async #createTransferTransactionMessage({ destinationAddress, amount, fromAccountPublicKey, blockhash, nonceAddressStr, version = 'legacy' }) {
+    let recentBlockhash = blockhash; // @TODO conditionally update with nonce
+
+    // new implementation
+    const signer = await generateKeyPair();
+    signer.publicKey
+
+    const { blockhash: latestBlockhash } = await this.#getLatestBlockhash();
+    const transactionMessage = createTransactionMessage({ version });
+
+    // Set the fee payer
+    const feePayer = await getAddressFromPublicKey(fromAccountPublicKey);
+    const transactionMessageWithFeePayer = setTransactionMessageFeePayer(feePayer, transactionMessage);
+
+    // 
+
+    // old implementation
     let recentBlockhash = block.hash;
+    /** @TODO */
     if (nonceAddress) {
       const nonceAccount = new Web3.PublicKey(nonceAddress);
-      const nonceAccountInfo = await this.connection.getNonce(nonceAccount);
+      const nonceAccountInfo = await this.rpc.getNonce(nonceAccount);
       recentBlockhash = nonceAccountInfo.nonce;
     }
     const instructions = [
@@ -195,37 +249,6 @@ class SolRPC {
       instructions
     }).compileToV0Message();
     return new Web3.VersionedTransaction(message);
-  }
-
-  /** @TODO */
-  async _createTransferTxTypeLegacy({ address, amount, fromAccount, block, nonceAddress }) {
-    let initParams = {
-      blockhash: block.hash,
-      feePayer: fromAccount,
-      lastValidBlockHeight: block.height + 1000 // block height 24 hours away
-    };
-    if (nonceAddress) {
-      const nonceAccount = new Web3.PublicKey(nonceAddress);
-      const nonceAccountInfo = await this.connection.getNonce(nonceAccount);
-      initParams = {
-        blockhash: nonceAccountInfo.nonce,
-        feePayer: fromAccount,
-        minContextSlot: block.height,
-        nonceInfo: {
-          nonce: nonceAccountInfo.nonce,
-          nonceInstruction: Web3.SystemProgram.nonceAdvance({
-            noncePubkey: nonceAccount,
-            authorizedPubkey: fromAccount
-          })
-        }
-      };
-    }
-
-    return new Web3.Transaction(initParams).add(Web3.SystemProgram.transfer({
-      fromPubkey: fromAccount,
-      toPubkey: address,
-      lamports: BigInt(amount)
-    }));
   }
 
   /** @TODO */
@@ -370,29 +393,45 @@ class SolRPC {
    * This function modifies the compute unit limit and sets the compute unit price for the transaction.
    * 
    * @param {Object} params - Parameters for adding priority fee.
-   * @param {Web3.VersionedTransaction} params.transaction - The transaction to which the priority fee will be added.
+   * @param {any} params.transaction - The transaction to which the priority fee will be added.
    * @param {number} [params.unitLimit=300] - The compute unit limit to set for the transaction.
    * @param {Object} params.config - Configuration options for retrieving prioritization fees.
    * @returns {Promise<Web3.VersionedTransaction>} The modified transaction with the added priority fee.
    * @throws Will throw an error if adding the priority fee fails for reasons other than 'Method not found'.
-   * @COMEBACK
+   * @DONE mostly - see TODO
    */
   async addPriorityFee({ transaction, unitLimit = 300, config }) {
     try {
       const priorityFee = await this.estimateMaxPriorityFee({ config });
-      const modifyComputeUnits = Web3.ComputeBudgetProgram.setComputeUnitLimit({ units: unitLimit });
-      const addPriorityFee = Web3.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: priorityFee });
-      transaction = transaction
-        .add(modifyComputeUnits)
-        .add(addPriorityFee);
+      if (priorityFee == null) {
+        throw new Error('Unexpected null priority fee');
+      }
+
+      const estimatedComputeUnits = await this.#getComputeUnitEstimate(transaction);
+      const budgetedTransactionMessage = prependTransactionMessageInstructions(
+        [
+            getSetComputeUnitLimitInstruction({ units: estimatedComputeUnits }), /** @TODO consider unitLimit */
+            getSetComputeUnitPriceInstruction({ microLamports: priorityFee })
+        ]
+      );
+
+      return budgetedTransactionMessage;
     } catch (err) {
+        /** @TODO throw */
       if (err && err.message !== 'failed to get recent prioritization fees: Method not found') {
         this.emitter.emit('failure', err);
         throw err;
       }
       console.warn('Priority fee\'s are not supported by this cluster', err);
     }
-    return transaction;
+  }
+
+  /** @DONE with inner TODO to consider buffering compute units */
+  async #getComputeUnitEstimate({ transactionMessage }) {
+    const getComputeUnitEstimate = getComputeUnitEstimateForTransactionMessageFactory({ rpc: this.rpc });
+    const estimatedComputeUnits = await getComputeUnitEstimate(transactionMessage);
+    /** @TODO a buffer would be appropriate here - like scaling (1.1x) or addition (x + 1000) */
+    return estimatedComputeUnits;
   }
 
   /**
@@ -488,6 +527,8 @@ class SolRPC {
    * @param {number} [config.limit=1000]
    * @param {import("@solana/web3.js").Slot} [config.minContextSlot]
    * @param {import("@solana/web3.js").Signature} [config.until]
+   * 
+   * @DONE
    */
   async #getSignaturesForAddress(addressStr, config) {
     const address = this.toAddress(addressStr);
@@ -694,7 +735,7 @@ class SolRPC {
    * 
    * @param {Array|Uint8Array|Buffer} arr - The input to convert.
    * @returns {Buffer} The converted Buffer instance.
-   * @REVIEW
+   * @DONE no change
    */
   toBuffer(arr) {
     if (Buffer.isBuffer(arr)) {
@@ -711,7 +752,7 @@ class SolRPC {
    * 
    * @param {string} str - The base64 encoded string to convert.
    * @returns {Uint8Array} The converted Uint8Array.
-   * @REVIEW
+   * @DONE no change
    */
   base64ToUint8Array(str) {
     // Decode the base64 string to a Buffer
@@ -726,7 +767,7 @@ class SolRPC {
    * 
    * @param {Array} arr - The Uint8Array to convert.
    * @returns {string} The converted base64 encoded string .
-   * @REVIEW
+   * @DONE no change
    */
   uint8ArrayToBase64(arr) {
     return this.toBuffer(arr).toString('base64');
